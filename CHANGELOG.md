@@ -1,6 +1,31 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
+## 1.1.3 — 2026-10
+
+### Fixed
+
+- **Legacy WebView rendering loop (Issue #2, completion).** Pages whose JavaScript can't be parsed by very old WebView engines (roughly Chrome ≤71, common on Android 7–8 with no WebView updates available) previously caused an endless cycle of white screens and reloads. After three consecutive failed renders, a circuit breaker now trips and parks the app on the loading page — permanently, until a single re-attempt after a 10-minute cooldown. The reload loop can no longer repeat endlessly.
+- **Retry counter stalling.** The host-retry attempt counter now increments when a retry is scheduled rather than after its delay elapses. Rapid successive connection failures can no longer erase the counter's progress, so backoff advances correctly (5s doubling to a 5-minute cap) instead of restarting from the beginning on every failure.
+- **Stacked fallback loops.** All render-failure witnesses (connection errors, empty-body detection, page watchdog) now record through a single code path, and waiting-page fallbacks are debounced to one per failure event. Duplicate recovery loops can no longer pile up during flapping connectivity.
+- **Network watcher no longer reloads on stale data.** The network-recovery poller only reloads the URL after confirming connectivity at the end of the poll cycle, instead of blindly firing a doomed reload after the wait budget was exhausted.
+
+### Changed
+
+- **Page load watchdog is now observational.** A page that takes longer than 20 seconds no longer gets interrupted with a fallback — slow is not dead. Empty-content detection is the sole basis for intervention, and it now requires two probes 5 seconds apart, and accepts visual elements (canvas, SVG, images, video, iframes) as evidence of a live page in addition to text.
+- **Auto-refresh suspends on persistent render failure.** While the render-failure count is elevated, the auto-refresh timer stands down rather than feeding the failure loop.
+- **Engine diagnostics on startup.** kiFOSSk now logs the detected WebView engine version and a legacy/modern classification at launch, making device reports actionable without adb archaeology.
+
+### Restored
+
+- **Normal rendering on legacy WebView engines.** The v1.1.x series inadvertently interfered with normal page rendering on older engines through the error-page suppression fallback. v1.1.3 removes that interference — dashboards that the WebView can handle render normally again.
+
+### Removed
+
+- Dead code: the legacy inline waiting-page builder and a vestigial retry-count accessor were removed.
+
+### Notes for very old devices
+
+On devices whose WebView engine predates the syntax used by a particular page's JavaScript, no kiosk app can force that page to render. What v1.1.3 guarantees: dashboards your device can handle render normally, and pages it can't degrade to a stable loading page instead of an endless white-screen cycle.
 
 ## [1.1.2] - 2026-09
 

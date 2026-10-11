@@ -1,0 +1,9 @@
+Fix: dashboards not rendering on legacy WebView engines (Android 7-8)
+- v1.1.x regression restored; pages that can't render trip a circuit breaker
+  into a stable loading page, ending the white-screen/reload cycle (#2)
+
+Fix: retry counter stalling at the second attempt - backoff now advances properly
+
+Also: duplicate recovery loops eliminated, slow-loading dashboards
+no longer mistaken for dead ones (charts/images count as live),
+WebView engine version detected and logged at startup

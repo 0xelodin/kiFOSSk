@@ -38,7 +38,13 @@ object NetworkRetryHelper {
                 retryCount++
             }
 
-            onConnected.invoke(targetUrl)
+            if (isNetworkAvailable(context)) {
+                android.util.Log.i("KioskRetry", "network recovered after $retryCount polls — reloading")
+                onConnected.invoke(targetUrl)
+            } else {
+                android.util.Log.w("KioskRetry",
+                    "network wait exhausted after $retryCount polls — standing down until next trigger")
+            }
         }
     }
 
@@ -54,12 +60,7 @@ object NetworkRetryHelper {
         return connectivityManager.activeNetworkInfo?.isConnected == true
     }
 
-    fun resetRetryCount() {
-        retryCount = 0
-    }
-
     fun startHostRetry(
-        context: Context,
         targetUrl: String,
         onRecovered: suspend (String) -> Unit
     ) {
@@ -71,12 +72,13 @@ object NetworkRetryHelper {
         }
         lastHostErrorTime = now
 
+        hostRetryAttempt++
+        val attempt = (hostRetryAttempt - 1).coerceAtMost(6)
+        val delayMs = (HOST_RETRY_INITIAL_MS shl attempt).coerceAtMost(HOST_RETRY_MAX_MS)
+        Log.d("KioskRetry", "Attempting retry #$attempt in ${delayMs}ms")
+
         hostJob = CoroutineScope(Dispatchers.Main).launch {
-            val attempt = hostRetryAttempt.coerceAtMost(6)
-            val delayMs = (HOST_RETRY_INITIAL_MS shl attempt).coerceAtMost(HOST_RETRY_MAX_MS)
-            Log.d("KioskRetry", "Attempting retry #$attempt in ${delayMs}ms")
             delay(delayMs)
-            hostRetryAttempt++
             onRecovered.invoke(targetUrl)
         }
     }
@@ -86,15 +88,5 @@ object NetworkRetryHelper {
         hostJob = null
         hostRetryAttempt = 0
         lastHostErrorTime = 0L
-    }
-
-    fun createWaitingPage(targetUrl: String): String {
-        return "<html><head><style>" +
-                "body{background-color:#1a1a2e;color:#6d4aff;text-align:center;" +
-                "font-family:sans-serif;padding-top:35%;margin:0;}" +
-                "h2{font-size:28px;}</style></head><body>" +
-                "<h2>Loading...</h2>" +
-                "<p style=\"color:#888;font-size:14px;\">Connecting to $targetUrl</p>" +
-                "</body></html>"
     }
 }

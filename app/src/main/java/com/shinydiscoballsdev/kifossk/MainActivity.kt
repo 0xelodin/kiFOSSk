@@ -7,6 +7,7 @@ import android.net.ConnectivityManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Build
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
@@ -35,9 +36,37 @@ class MainActivity : AppCompatActivity() {
 
     private val navHandler = Handler(Looper.getMainLooper())
     private var watchdogRunnable: Runnable? = null
+    private var reprobeRunnable: Runnable? = null
     companion object {
         private const val PAGE_LOAD_TIMEOUT_MS = 20_000L
+        private const val REPROBE_DELAY_MS = 5_000L
+        private const val BREAKER_OPEN_THRESHOLD = 3
+
+        // Bounded self-healing: after the breaker opens, exactly ONE
+        // re-attempt is permitted per cooldown window. Worst-case duty
+        // cycle: 3 quick strikes, then 10 minutes of silence.
+        private const val BREAKER_COOLDOWN_MS = 10 * 60_000L
+
+        private const val WITNESS_JS =
+            "(function(){" +
+                    "var doc=document.documentElement;" +
+                    "if(doc&&doc.getAttribute&&doc.getAttribute('data-kiosk')==='waiting'){return 'waiting';};" +
+                    "if(!document.body){return 'empty'};" +
+                    "var hasText = document.body.innerText.trim().length > 0;" +
+                    "var hasVisual = document.querySelector('canvas, svg, img, iframe, video') !== null;" +
+                    "return (hasText || hasVisual) ? 'ok' : 'empty'" +
+                    "})()"
     }
+
+    private var breakerResetRunnable: Runnable? = null
+
+    // debounce — onReceivedError, empty-body probe, and watchdog can all
+    // fire for one failure event; one fallback per event, no stacked loops
+    private var lastWaitingPageAt = 0L
+
+    // Issue #2: consecutive render-failure counter — breaks the
+    // waiting-page <-> empty-site reload loop on engines too old for the site
+    private var consecutiveRenderFailures = 0
 
     private fun applyKeepScreenOnFlag() {
         val keepScreenOn = KioskPrefs.getScreenOn(this)
@@ -48,9 +77,37 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ─── ENGINE DETECTION (Issue #2 diagnostics) ─────────────────────────────────────
+    private var cachedWebViewVersion: String? = null
+    private var cachedIsLegacyEngine: Boolean? = null
+
+    private fun probeWebViewEngine() {
+        val (versionName, isLegacy) = try {
+            val vm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                WebView.getCurrentWebViewPackage()?.versionName
+            } else {
+                val pm = packageManager
+                listOf("com.google.android.webview", "com.android.chrome").firstNotNullOfOrNull { pkg ->
+                    pm.getInstalledPackages(0).find { it.packageName == pkg }?.versionName
+                }
+            }
+            val major = vm?.split('.')?.firstOrNull()?.toIntOrNull()
+            Pair(vm ?: "unknown", (major ?: 0) < 72)
+        } catch (_: Exception) {
+            Pair("unknown", true)
+        }
+
+        cachedWebViewVersion = versionName
+        cachedIsLegacyEngine = isLegacy
+        android.util.Log.i("KioskWebView", "engine=$versionName legacy=$isLegacy")
+    }
+    // ────────────────────────────────────────────────────────────────────────────────
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Issue #2: diagnose WebView engine for future reports
+        probeWebViewEngine()
         // Wake screen and show over lockscreen (API 27+)
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
@@ -112,7 +169,6 @@ class MainActivity : AppCompatActivity() {
         }
         webView.setOnLongClickListener { true }
 
-        // SINGLE WebViewClient — the old duplicate dead assignment is gone.
         webView.webViewClient = object : WebViewClient() {
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
@@ -124,9 +180,8 @@ class MainActivity : AppCompatActivity() {
                 watchdogRunnable?.let { navHandler.removeCallbacks(it) }
 
                 watchdogRunnable = Runnable {
-                    android.util.Log.w("KioskLoad", "WATCHDOG: no page completion for $url in ${PAGE_LOAD_TIMEOUT_MS / 1000}s — forcing waiting page")
+                    android.util.Log.i("KioskLoad", "WATCHDOG: no page completion for $url after ${PAGE_LOAD_TIMEOUT_MS / 1000}s — observing, not intervening (v1.0.3 patience parity)")
                     currentUrl = KioskPrefs.getUrl(this@MainActivity)
-                    loadWaitingPage(currentUrl, failedOverNetwork = true)
                 }.also { navHandler.postDelayed(it, PAGE_LOAD_TIMEOUT_MS) }
             }
 
@@ -137,25 +192,51 @@ class MainActivity : AppCompatActivity() {
                 // Load completed — stand down the watchdog
                 watchdogRunnable?.let { navHandler.removeCallbacks(it) }
                 watchdogRunnable = null
-                // Guard JS injection — documentElement can be null on
-                // about:blank (waiting page) and chrome-error:// pages
+
+                // GUARD: Don't run probe on chrome-error:// or waiting page
+                // These show text but it's not evidence of health — just exculpatory noise
+                if (url.startsWith("chrome-error://") || url.startsWith("file:///android_asset/")) {
+                    // Skip the witness probe entirely on these URLs
+                    setupAutoRefresh()
+                    return
+                }
+
+                // Guard JS injection — documentElement can be null on about:blank and chrome-error:// pages
                 view.evaluateJavascript(
                     "if (document.documentElement) {" +
                             "document.documentElement.style.webkitUserSelect = 'none';" +
-                            "document.documentElement.style.userSelect = 'none';}",
+                            "document.documentElement.style.userSelect = 'none';" +
+                            "}",
                     null
                 )
 
-                // Empty-content watchdog
+                // Empty-content watchdog. two-witness probe, delayed conviction
                 if (!url.startsWith("file:") && !url.startsWith("about:") && !url.startsWith("data:")) {
-                    view.evaluateJavascript(
-                        "(document.body && document.body.innerText.trim().length > 0) ? 'ok' : 'empty'"
-                    ) { result ->
+                    // Stand down any pending re-probe from a previous page
+                    reprobeRunnable?.let { navHandler.removeCallbacks(it) }
+                    reprobeRunnable = null
+
+                    view.evaluateJavascript(WITNESS_JS) { result ->
                         if (result == "\"empty\"") {
-                            android.util.Log.i("KioskLoad", "onPageFinished: empty body for $url — fallback to waiting page")
-                            currentUrl = KioskPrefs.getUrl(this@MainActivity)
-                            loadWaitingPage(currentUrl, failedOverNetwork = true)
+                            // One snapshot proves nothing. Re-probe after 5s. Only
+                            // persistent emptiness counts as a strike.
+                            reprobeRunnable = Runnable {
+                                view.evaluateJavascript(WITNESS_JS) { second ->
+                                    if (second == "\"empty\"") {
+                                        handleEmptyRender(url)
+                                    } else if (second == "\"ok\"") {
+                                        android.util.Log.i("KioskLoad",
+                                            "PROBE OK — counter reset (was $consecutiveRenderFailures) url=$url")
+                                        consecutiveRenderFailures = 0
+                                    }
+                                }
+                            }.also { navHandler.postDelayed(it, REPROBE_DELAY_MS) }
+                        } else if (result == "\"ok\"") {
+                            android.util.Log.i("KioskLoad",
+                                "PROBE OK — counter reset (was $consecutiveRenderFailures) url=$url")
+                            consecutiveRenderFailures = 0
                         }
+                        // result == null OR "\"waiting\"": silence, count preserved
                     }
                 }
                 // Auto-refresh setup (runs on every page load)
@@ -173,11 +254,11 @@ class MainActivity : AppCompatActivity() {
                 val urlStr = request?.url?.toString() ?: ""
                 if (urlStr.startsWith("about:") || urlStr.startsWith("file:///android_asset/")) return
 
-                // FIX #3: only main-frame failures trigger the waiting page;
+                // only main-frame failures trigger the waiting page;
                 // subresource 404s must not hijack the kiosk
                 if (request?.isForMainFrame == true) {
                     currentUrl = KioskPrefs.getUrl(this@MainActivity)
-                    loadWaitingPage(currentUrl, failedOverNetwork = true)
+                    registerRenderStrike("onReceivedError")
                 }
             }
         }
@@ -242,7 +323,8 @@ class MainActivity : AppCompatActivity() {
 
         refreshRunnable = object : Runnable {
             override fun run() {
-                if (KioskPrefs.isAutoRefreshEnabled(this@MainActivity)) {
+                if (KioskPrefs.isAutoRefreshEnabled(this@MainActivity) &&
+                    consecutiveRenderFailures < 3) {
                     // Read URL fresh each tick — no stale captured copies
                     currentUrl = KioskPrefs.getUrl(this@MainActivity)
                     webView.loadUrl(currentUrl)
@@ -293,18 +375,71 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
+    // Shared strike recorder, the empty-body probe, and
+    // onReceivedError all testify through this one door.
+    private fun registerRenderStrike(source: String) {
+
+        consecutiveRenderFailures++
+        android.util.Log.i("KioskLoad", "render strike #$consecutiveRenderFailures ($source)")
+
+        if (consecutiveRenderFailures >= BREAKER_OPEN_THRESHOLD) {
+            android.util.Log.w("KioskLoad",
+                "circuit breaker open after $consecutiveRenderFailures empty renders ($source) — " +
+                        "holding waiting page, re-attempt in ${BREAKER_COOLDOWN_MS / 60_000L}min")
+            NetworkRetryHelper.stopHostRetry()
+            lastWaitingPageAt = 0L   // deliberate bypass — one waiting page per event
+
+            // Breaker terminal: no recovery watcher; the cooldown is the only re-attempt
+            loadWaitingPage(currentUrl, failedOverNetwork = false, recoveryArmed = false)
+
+            scheduleBreakerCooldownReset()
+        } else {
+            loadWaitingPage(currentUrl, failedOverNetwork = true)
+        }
+    }
+
+    private fun scheduleBreakerCooldownReset() {
+        breakerResetRunnable?.let { navHandler.removeCallbacks(it) }
+        breakerResetRunnable = Runnable {
+            if (consecutiveRenderFailures >= BREAKER_OPEN_THRESHOLD) {
+                android.util.Log.i("KioskLoad",
+                    "breaker cooldown elapsed — resetting counter (was $consecutiveRenderFailures), one re-attempt")
+                consecutiveRenderFailures = 0
+                currentUrl = KioskPrefs.getUrl(this)
+                webView.loadUrl(currentUrl)
+            }
+        }.also { navHandler.postDelayed(it, BREAKER_COOLDOWN_MS) }
+    }
+
+    private fun handleEmptyRender(url: String) {
+        android.util.Log.i("KioskLoad",
+            "onPageFinished: empty body x${consecutiveRenderFailures + 1} for $url")
+        registerRenderStrike("empty-body")
+    }
+
     @SuppressLint("SetTextI18n")
-    private fun loadWaitingPage(targetUrl: String, failedOverNetwork: Boolean = false) {
+    private fun loadWaitingPage(
+        targetUrl: String,
+        failedOverNetwork: Boolean = false,
+        recoveryArmed: Boolean = true
+    ) {
+        // debounce — onReceivedError, empty-body probe, and the watchdog
+        // can all fire for one failure event; one fallback per event
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastWaitingPageAt < 3_000L) return
+        lastWaitingPageAt = now
+
         webView.setBackgroundColor(android.graphics.Color.parseColor("#1a1a2e"))
 
-        // Issue #2 FIX: loadUrl with real asset instead of loadDataWithBaseURL
         val encodedUrl = android.net.Uri.encode(targetUrl)
         webView.loadUrl("file:///android_asset/waiting.html?url=$encodedUrl")
 
+        if (!recoveryArmed) return
+
         if (failedOverNetwork) {
-            NetworkRetryHelper.startHostRetry(this, targetUrl) { url -> webView.loadUrl(url) }
+            NetworkRetryHelper.startHostRetry(targetUrl) { url: String -> webView.loadUrl(url) }
         } else {
-            NetworkRetryHelper.startWaitingForNetwork(this, targetUrl) { url -> webView.loadUrl(url) }
+            NetworkRetryHelper.startWaitingForNetwork(this, targetUrl) { url: String -> webView.loadUrl(url) }
         }
     }
 }

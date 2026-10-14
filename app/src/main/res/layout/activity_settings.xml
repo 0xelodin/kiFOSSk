@@ -58,6 +58,39 @@
             android:checked="true"
             android:text="Prevent screen timeout while charging"/>
 
+        <!-- Screen Schedule -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Screen Schedule"
+            android:textSize="16sp"
+            android:textColor="?android:attr/textColorSecondary"
+            android:layout_marginTop="24dp"
+            android:layout_marginBottom="8dp"/>
+
+        <androidx.appcompat.widget.SwitchCompat
+            android:id="@+id/switchSchedule"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:checked="false"
+            android:text="Use schedule (replaces Keep Screen On)"/>
+
+        <TextView
+            android:id="@+id/textScheduleHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Keep on: the screen stays on in these periods; outside them it goes dark after the system screen timeout. Wake: the screen turns on by itself. Dim: lowers the brightness of the dashboard."
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorHint"
+            android:layout_marginTop="4dp"/>
+
+        <!-- Rows are added by SettingsActivity.buildScheduleRows() -->
+        <LinearLayout
+            android:id="@+id/layoutSchedule"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"/>
+
         <!-- Orientation -->
         <TextView
             android:layout_width="match_parent"

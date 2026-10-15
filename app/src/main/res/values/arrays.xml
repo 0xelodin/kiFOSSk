@@ -21,4 +21,20 @@
         <item>300</item>
         <item>900</item>
     </integer-array>
+
+    <string-array name="dim_levels">
+        <item>5%</item>
+        <item>10%</item>
+        <item>20%</item>
+        <item>30%</item>
+        <item>50%</item>
+    </string-array>
+
+    <integer-array name="dim_level_values">
+        <item>5</item>
+        <item>10</item>
+        <item>20</item>
+        <item>30</item>
+        <item>50</item>
+    </integer-array>
 </resources>

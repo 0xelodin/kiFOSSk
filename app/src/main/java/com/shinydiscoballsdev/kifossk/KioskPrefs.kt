@@ -66,4 +66,34 @@ object KioskPrefs {
             .putInt("auto_refresh_interval", intervalSeconds)
             .apply()
     }
+
+    // ─── SCREEN SCHEDULE (see ScreenSchedule) ───────────────────────────
+    fun isScheduleEnabled(context: Context): Boolean {
+        return getInstance(context).getBoolean("schedule_enabled", false)
+    }
+
+    fun setScheduleEnabled(context: Context, value: Boolean) {
+        getInstance(context).edit().putBoolean("schedule_enabled", value).apply()
+    }
+
+    /** Entry switch + time text ("HH:MM" or "HH:MM-HH:MM"). */
+    fun getScheduleEntry(context: Context, key: String, default: String): Pair<Boolean, String> {
+        val prefs = getInstance(context)
+        return Pair(prefs.getBoolean("${key}_enabled", false), prefs.getString(key, default) ?: default)
+    }
+
+    fun setScheduleEntry(context: Context, key: String, enabled: Boolean, value: String) {
+        getInstance(context).edit()
+            .putBoolean("${key}_enabled", enabled)
+            .putString(key, value)
+            .apply()
+    }
+
+    fun getDimPercent(context: Context): Int {
+        return getInstance(context).getInt("schedule_dim_percent", 20)
+    }
+
+    fun setDimPercent(context: Context, value: Int) {
+        getInstance(context).edit().putInt("schedule_dim_percent", value).apply()
+    }
 }

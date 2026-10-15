@@ -20,6 +20,7 @@ import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import android.webkit.WebSettings
 import android.graphics.Bitmap
+import java.util.Calendar
 
 @SuppressLint("SetJavaScriptEnabled")
 class MainActivity : AppCompatActivity() {
@@ -47,6 +48,8 @@ class MainActivity : AppCompatActivity() {
         // cycle: 3 quick strikes, then 10 minutes of silence.
         private const val BREAKER_COOLDOWN_MS = 10 * 60_000L
 
+        private const val SCHEDULE_TICK_MS = 30_000L
+
         private const val WITNESS_JS =
             "(function(){" +
                     "var doc=document.documentElement;" +
@@ -68,12 +71,34 @@ class MainActivity : AppCompatActivity() {
     // waiting-page <-> empty-site reload loop on engines too old for the site
     private var consecutiveRenderFailures = 0
 
+    // Keep-on flag and dimming. With the screen schedule enabled both follow
+    // ScreenSchedule, otherwise the "Keep Screen On" switch as before.
+    // Dimming only changes the kiosk window, never the system brightness.
     private fun applyKeepScreenOnFlag() {
-        val keepScreenOn = KioskPrefs.getScreenOn(this)
+        val now = Calendar.getInstance()
+        val scheduled = KioskPrefs.isScheduleEnabled(this)
+
+        val keepScreenOn = if (scheduled) ScreenSchedule.isKeepOn(this, now) else KioskPrefs.getScreenOn(this)
         if (keepScreenOn) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+
+        val brightness = (if (scheduled) ScreenSchedule.dimLevel(this, now) else null)
+            ?: WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        if (window.attributes.screenBrightness != brightness) {
+            window.attributes = window.attributes.apply { screenBrightness = brightness }
+        }
+    }
+
+    // Screen schedule: re-check every 30 s while the kiosk is visible, so
+    // keep-on and dimming periods start and end on time without a touch
+    private val scheduleHandler = Handler(Looper.getMainLooper())
+    private val scheduleTick = object : Runnable {
+        override fun run() {
+            applyKeepScreenOnFlag()
+            scheduleHandler.postDelayed(this, SCHEDULE_TICK_MS)
         }
     }
 
@@ -344,6 +369,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         stopAutoRefresh()
+        scheduleHandler.removeCallbacks(scheduleTick)
         super.onPause()
     }
 
@@ -351,6 +377,13 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         // Refresh loop resumes in onPageFinished() after page loads
         applyKeepScreenOnFlag()
+        scheduleHandler.removeCallbacks(scheduleTick)
+        if (KioskPrefs.isScheduleEnabled(this)) {
+            scheduleHandler.postDelayed(scheduleTick, SCHEDULE_TICK_MS)
+        }
+        // Cheap and idempotent: keeps the wake alarm armed after boot,
+        // settings changes and clock changes
+        ScreenWakeReceiver.schedule(this)
     }
 
     override fun dispatchTouchEvent(event: MotionEvent?): Boolean {
@@ -369,6 +402,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         stopAutoRefresh()
+        scheduleHandler.removeCallbacksAndMessages(null)
         navHandler.removeCallbacksAndMessages(null)
         NetworkRetryHelper.stopWaiting()
         NetworkRetryHelper.stopHostRetry()
